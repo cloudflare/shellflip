@@ -1,0 +1,378 @@
+//! Graceful restart management inspired by tableflip, but more basic.
+//! 
+//! To implement restarts, the simplest thing to do is to generate a `RestartConfig` from
+//! command-line values or hardcoded defaults, then call `RestartConfig::try_into_restart_task`. If
+//! you implement a restart command using unix sockets for interactive error reporting, call
+//! `RestartConfig::request_restart` and return the Result in your main() function.
+//!
+//! The process is automatically placed into the ready state the first time the restart task is
+//! polled. This should be put into a select statement with other futures your app may await on.
+//! The restart task will resolve with `Ok(())` if a restart signal was sent and the new process
+//! spawned successfully. If the task is unable to handle future restart signals for any reason,
+//! it will resolve to an `Err`.
+//!
+//! The process can also be restarted by sending it SIGUSR1. After any kind of restart request, the
+//! old process will terminate if the new process starts up successfully, otherwise it will
+//! continue if possible.
+//! 
+//! For coordinating graceful shutdown of the old process, see `ShutdownCoordinator` in the
+//! `shutdown` module.
+//! 
+//! # Restart thread
+//! 
+//! Process restarts are handled by a dedicated thread which is spawned when calling either
+//! `RestartConfig::try_into_restart_task` or `spawn_restart_task`. If you are dropping privileges,
+//! capabilities or using seccomp policies to limit the syscalls that can execute, it is a good
+//! idea to call the aforementioned functions before locking down the main & future child threads.
+//! You likely don't want the restart thread to have the same restrictions and limitations that may
+//! otherwise prevent you from calling execve() or doing certain I/O operations.
+pub mod restart_coordination_socket;
+pub mod shutdown;
+mod pipes;
+
+pub use shutdown::{ShutdownCoordinator, ShutdownHandle, ShutdownSignal};
+
+use crate::restart_coordination_socket::{
+    RestartCoordinationSocket, RestartMessage, RestartRequest, RestartResponse,
+};
+use anyhow::anyhow;
+use futures::stream::{Stream, StreamExt};
+use serde::Deserialize;
+use std::env;
+use std::fs::remove_file;
+use std::future::Future;
+use std::io;
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::net::UnixListener as StdUnixListener;
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process;
+use std::thread;
+use thiserror::Error;
+use tokio::net::{UnixListener, UnixStream};
+use tokio::select;
+use tokio::signal::unix::{signal, Signal, SignalKind};
+use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio_stream::wrappers::UnixListenerStream;
+
+pub type RestartResult<T> = anyhow::Result<T>;
+
+const ENV_NOTIFY_SOCKET: &str = "OXY_NOTIFY_SOCKET";
+const ENV_RESTART_SOCKET: &str = "OXY_RESTART_SOCKET";
+const ENV_SYSTEMD_PID: &str = "LISTEN_PID";
+const REBIND_SYSTEMD_PID: &str = "auto";
+
+/// Settings for graceful restarts
+#[derive(Clone, Debug, Deserialize)]
+pub struct RestartConfig {
+    /// Enables the restart coordination socket for graceful restarts as an alternative to the SIGUSR1 signal.
+    pub enabled: bool,
+    /// Socket path
+    pub coordination_socket_path: PathBuf,
+}
+
+impl RestartConfig {
+    /// Prepare the current process to handle restarts, if enabled.
+    pub fn try_into_restart_task(self) -> io::Result<(impl Future<Output = RestartResult<()>> + Send)> {
+        fixup_systemd_env();
+        spawn_restart_task(&self)
+    }
+
+    /// Request an already-running service to restart.
+    pub async fn request_restart(self) -> RestartResult<u32> {
+        if !self.enabled {
+            return Err(anyhow!(
+                "no restart coordination socket socket defined in config"
+            ));
+        }
+
+        let socket = UnixStream::connect(self.coordination_socket_path).await?;
+        restart_coordination_socket::RestartCoordinationSocket::new(socket)
+            .send_restart_command()
+            .await
+    }
+
+    /// Request an already-running service to restart.
+    /// Does not require the tokio runtime to be started yet.
+    pub fn request_restart_sync(self) -> RestartResult<u32> {
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(self.request_restart())
+    }
+}
+
+/// When the proxy restarts itself, it sets the child's LISTEN_PID env to a
+/// special value so that the child can replace it with the real child PID.
+/// Doing this is easier than reimplementing rust's process spawn code just so
+/// we can call execvpe to replace the environment in the forked process.
+///
+/// This is usually called by `RestartConfig::try_into_restart_task` but this function is available
+/// if it needs to be done at an earlier or more convenient time, such as the top of `fn main()`.
+pub fn fixup_systemd_env() {
+    #[cfg(target_os = "linux")]
+    if let Ok(true) = env::var(ENV_SYSTEMD_PID).map(|p| p == REBIND_SYSTEMD_PID) {
+        env::set_var(ENV_SYSTEMD_PID, process::id().to_string());
+    }
+}
+
+/// Notify systemd and the parent process (if any) that the proxy has started successfully.
+/// Returns an error if there was a parent process and we failed to notify it.
+/// 
+/// This is usually called by the restart task returned from `RestartConfig::try_into_restart_task`
+/// but this function is available if indicating readiness needs to happen sooner or at a more
+/// convenient time then first polling the restart task.
+pub fn startup_complete() -> io::Result<()> {
+    if let Ok(notify_fd) = env::var(ENV_NOTIFY_SOCKET) {
+        pipes::CompletionSender::from_fd_string(&notify_fd)?.send()?;
+    }
+    // Avoid sending twice on the notification pipe, if this is manually called outside
+    // of the restart task.
+    env::remove_var(ENV_NOTIFY_SOCKET);
+
+    let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
+    Ok(())
+}
+
+/// Returns the restart completion or error message through the restart coordination socket, if used.
+struct RestartResponder {
+    rpc: Option<RestartCoordinationSocket>,
+}
+
+impl RestartResponder {
+    /// Send success or failure to the restart coordination socket client.
+    async fn respond(self, result: Result<u32, String>) {
+        let response = match result {
+            Ok(pid) => RestartResponse::RestartComplete(pid),
+            Err(e) => RestartResponse::RestartFailed(e),
+        };
+        if let Some(mut rpc) = self.rpc {
+            if let Err(e) = rpc.send_message(RestartMessage::Response(response)).await {
+                log::warn!("Failed to respond to restart coordinator: {}", e);
+            }
+        }
+    }
+}
+
+/// Spawns a thread that can be used to restart the process.
+/// Returns a future that resolves when a restart succeeds, or if restart
+/// becomes impossible.
+/// The child spawner thread needs to be created before seccomp locks down fork/exec.
+pub fn spawn_restart_task(
+    settings: &RestartConfig,
+) -> io::Result<impl Future<Output = RestartResult<()>> + Send> {
+    let socket = match settings.enabled {
+        true => Some(settings.coordination_socket_path.as_ref()),
+        false => None,
+    };
+
+    let mut signal_stream = signal(SignalKind::user_defined1())?;
+    let (restart_fd, mut socket_stream) = new_restart_coordination_socket_stream(socket)?;
+    let mut child_spawner = ChildSpawner::new(restart_fd);
+
+    Ok(async move {
+        startup_complete()?;
+        loop {
+            let responder = next_restart_request(&mut signal_stream, &mut socket_stream).await?;
+
+            log::debug!("Spawning new process");
+            let res = child_spawner.spawn_new_process().await;
+
+            responder
+                .respond(res.as_ref().map(|p| *p).map_err(|e| e.to_string()))
+                .await;
+
+            match res {
+                Ok(pid) => {
+                    log::debug!("New process spawned with pid {}", pid);
+
+                    if let Err(e) = sd_notify::notify(true, &[sd_notify::NotifyState::MainPid(pid)])
+                    {
+                        log::error!("Failed to notify systemd: {}", e);
+                    }
+
+                    return Ok(());
+                }
+                Err(ChildSpawnError::ChildError(e)) => {
+                    log::error!("Restart failed: {}", e);
+                }
+                Err(ChildSpawnError::RestartThreadGone) => {
+                    res?;
+                }
+            }
+        }
+    })
+}
+
+/// Handles forking a new client in a more privileged thread.
+struct ChildSpawner {
+    signal_sender: Sender<()>,
+    pid_receiver: Receiver<io::Result<process::Child>>,
+}
+
+impl ChildSpawner {
+    /// Create a ChildSpawner that will pass restart_fd to child processes.
+    fn new(restart_fd: Option<RawFd>) -> Self {
+        let (signal_sender, mut signal_receiver) = channel(1);
+        let (pid_sender, pid_receiver) = channel(1);
+
+        thread::spawn(move || {
+            while let Some(()) = signal_receiver.blocking_recv() {
+                pid_sender
+                    .blocking_send(spawn_child(restart_fd))
+                    .expect("parent needs to receive the child");
+            }
+        });
+
+        ChildSpawner {
+            signal_sender,
+            pid_receiver,
+        }
+    }
+
+    /// Spawn a process via IPC to the privileged thread.
+    /// Returns the child pid on success.
+    async fn spawn_new_process(&mut self) -> Result<u32, ChildSpawnError> {
+        self.signal_sender
+            .send(())
+            .await
+            .map_err(|_| ChildSpawnError::RestartThreadGone)?;
+        match self.pid_receiver.recv().await {
+            Some(Ok(child)) => Ok(child.id()),
+            Some(Err(e)) => Err(ChildSpawnError::ChildError(e)),
+            None => Err(ChildSpawnError::RestartThreadGone),
+        }
+    }
+}
+
+/// Indicates an error that happened during child forking.
+#[derive(Error, Debug)]
+pub enum ChildSpawnError {
+    #[error("Restart thread exited")]
+    RestartThreadGone,
+    #[error("Child failed to start: {0}")]
+    ChildError(io::Error),
+}
+
+/// Await the next request to gracefully restart the process.
+/// Returns a RestartResponder used to receive the outcome of the restart attempt.
+async fn next_restart_request(
+    signal_stream: &mut Signal,
+    mut socket_stream: impl Stream<Item = RestartResponder> + Unpin,
+) -> RestartResult<RestartResponder> {
+    select! {
+        _ = signal_stream.recv() => Ok(RestartResponder{ rpc: None }),
+        r = socket_stream.next() => match r {
+            Some(r) => Ok(r),
+            None => {
+                // Technically we can still support signal restart! However if you have the restart coordination
+                // socket enabled you probably don't want to use signals, and need to recover the process such
+                // that you can use the restart coordinator socket again.
+                Err(anyhow!("Restart coordinator socket acceptor terminated"))
+            }
+        }
+    }
+}
+
+fn new_restart_coordination_socket_stream(
+    restart_coordination_socket: Option<&Path>,
+) -> io::Result<(Option<RawFd>, impl Stream<Item = RestartResponder>)> {
+    if let Some(path) = restart_coordination_socket {
+        let listener = bind_restart_coordination_socket(path)?;
+        let fd = listener.as_raw_fd();
+        let st = listen_for_restart_events(listener);
+        Ok((Some(fd), st.boxed()))
+    } else {
+        Ok((None, futures::stream::pending().boxed()))
+    }
+}
+
+fn bind_restart_coordination_socket(path: &Path) -> io::Result<UnixListener> {
+    match env::var(ENV_RESTART_SOCKET) {
+        Err(_) => {
+            // This may fail but binding will succeed despite that. If binding fails,
+            // that's the error we really care about.
+            let _ = remove_file(path);
+            UnixListener::bind(path)
+        }
+        Ok(maybe_sock_fd) => match maybe_sock_fd.parse() {
+            Ok(fd) => {
+                Ok(UnixListener::from_std(unsafe { StdUnixListener::from_raw_fd(fd) }).unwrap())
+            }
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "inherited restart coordination socket is not an fd",
+            )),
+        },
+    }
+}
+
+fn listen_for_restart_events(
+    restart_coordination_socket: UnixListener,
+) -> impl Stream<Item = RestartResponder> {
+    UnixListenerStream::new(restart_coordination_socket).filter_map(move |r| async move {
+        let sock = match r {
+            Ok(sock) => sock,
+            Err(e) => {
+                log::error!("Restart coordination socket accept error: {}", e);
+                return None;
+            }
+        };
+
+        let mut rpc = RestartCoordinationSocket::new(sock);
+        match rpc.receive_message().await {
+            Ok(RestartMessage::Request(RestartRequest::TryRestart)) => {
+                Some(RestartResponder { rpc: Some(rpc) })
+            }
+            Ok(m) => {
+                log::warn!(
+                    "Restart coordination socket received unexpected message: {:?}",
+                    m
+                );
+                None
+            }
+            Err(e) => {
+                log::warn!("Restart coordination socket connection error: {}", e);
+                None
+            }
+        }
+    })
+}
+
+/// Clears the FD_CLOEXEC flag on a fd so it can be inherited by a child process.
+fn clear_cloexec(fd: RawFd) -> nix::Result<()> {
+    use nix::fcntl::*;
+    let mut current_flags = FdFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFD)?);
+    current_flags.remove(FdFlag::FD_CLOEXEC);
+    fcntl(fd, FcntlArg::F_SETFD(current_flags))?;
+    Ok(())
+}
+
+/// Attempt to start a new instance of this proxy.
+fn spawn_child(restart_fd: Option<RawFd>) -> io::Result<process::Child> {
+    let mut args = env::args();
+    let process_name = args.next().unwrap();
+
+    // Create a pipe for the child to notify us on successful startup
+    let (mut notif_r, notif_w) = pipes::pipe_pair()?;
+
+    let mut cmd = process::Command::new(process_name);
+    cmd.args(args)
+        .env(ENV_SYSTEMD_PID, REBIND_SYSTEMD_PID)
+        .env(ENV_NOTIFY_SOCKET, notif_w.fd_string());
+    if let Some(fd) = restart_fd {
+        // Let the child inherit the restart coordination socket
+        unsafe {
+            cmd.env(ENV_RESTART_SOCKET, fd.to_string())
+                .pre_exec(move || {
+                    clear_cloexec(fd)?;
+                    Ok(())
+                });
+        }
+    }
+    let child = cmd.spawn()?;
+
+    // only the child needs the write end
+    drop(notif_w);
+    notif_r.recv()?;
+    Ok(child)
+}
