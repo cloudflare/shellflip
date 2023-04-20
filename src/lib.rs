@@ -38,6 +38,7 @@ use crate::restart_coordination_socket::{
 use anyhow::anyhow;
 use futures::stream::{Stream, StreamExt};
 use std::env;
+use std::ffi::OsString;
 use std::fs::remove_file;
 use std::future::Future;
 use std::io;
@@ -67,6 +68,8 @@ pub struct RestartConfig {
     pub enabled: bool,
     /// Socket path
     pub coordination_socket_path: PathBuf,
+    /// Sets environment variables on the newly-started process
+    pub environment: Vec<(OsString, OsString)>,
 }
 
 impl RestartConfig {
@@ -75,7 +78,7 @@ impl RestartConfig {
         self,
     ) -> io::Result<(impl Future<Output = RestartResult<process::Child>> + Send)> {
         fixup_systemd_env();
-        spawn_restart_task(&self)
+        spawn_restart_task(self)
     }
 
     /// Request an already-running service to restart.
@@ -106,6 +109,7 @@ impl Default for RestartConfig {
         RestartConfig {
             enabled: false,
             coordination_socket_path: Default::default(),
+            environment: vec![],
         }
     }
 }
@@ -167,7 +171,7 @@ impl RestartResponder {
 /// becomes impossible.
 /// The child spawner thread needs to be created before seccomp locks down fork/exec.
 pub fn spawn_restart_task(
-    settings: &RestartConfig,
+    settings: RestartConfig,
 ) -> io::Result<impl Future<Output = RestartResult<process::Child>> + Send> {
     let socket = match settings.enabled {
         true => Some(settings.coordination_socket_path.as_ref()),
@@ -176,7 +180,7 @@ pub fn spawn_restart_task(
 
     let mut signal_stream = signal(SignalKind::user_defined1())?;
     let (restart_fd, mut socket_stream) = new_restart_coordination_socket_stream(socket)?;
-    let mut child_spawner = ChildSpawner::new(restart_fd);
+    let mut child_spawner = ChildSpawner::new(restart_fd, settings.environment);
 
     Ok(async move {
         startup_complete()?;
@@ -221,14 +225,14 @@ struct ChildSpawner {
 
 impl ChildSpawner {
     /// Create a ChildSpawner that will pass restart_fd to child processes.
-    fn new(restart_fd: Option<RawFd>) -> Self {
+    fn new(restart_fd: Option<RawFd>, environment: Vec<(OsString, OsString)>) -> Self {
         let (signal_sender, mut signal_receiver) = channel(1);
         let (pid_sender, pid_receiver) = channel(1);
 
         thread::spawn(move || {
             while let Some(()) = signal_receiver.blocking_recv() {
                 pid_sender
-                    .blocking_send(spawn_child(restart_fd))
+                    .blocking_send(spawn_child(restart_fd, &environment))
                     .expect("parent needs to receive the child");
             }
         });
@@ -358,7 +362,10 @@ fn clear_cloexec(fd: RawFd) -> nix::Result<()> {
 }
 
 /// Attempt to start a new instance of this proxy.
-fn spawn_child(restart_fd: Option<RawFd>) -> io::Result<process::Child> {
+fn spawn_child(
+    restart_fd: Option<RawFd>,
+    user_envs: &[(OsString, OsString)],
+) -> io::Result<process::Child> {
     let mut args = env::args();
     let process_name = args.next().unwrap();
 
@@ -367,8 +374,10 @@ fn spawn_child(restart_fd: Option<RawFd>) -> io::Result<process::Child> {
 
     let mut cmd = process::Command::new(process_name);
     cmd.args(args)
+        .envs(user_envs.iter().map(|(k, v)| (k, v)))
         .env(ENV_SYSTEMD_PID, REBIND_SYSTEMD_PID)
         .env(ENV_NOTIFY_SOCKET, notif_w.fd_string());
+
     if let Some(fd) = restart_fd {
         // Let the child inherit the restart coordination socket
         unsafe {
