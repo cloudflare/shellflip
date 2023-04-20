@@ -37,7 +37,6 @@ use crate::restart_coordination_socket::{
 };
 use anyhow::anyhow;
 use futures::stream::{Stream, StreamExt};
-use serde::Deserialize;
 use std::env;
 use std::fs::remove_file;
 use std::future::Future;
@@ -63,7 +62,6 @@ const ENV_SYSTEMD_PID: &str = "LISTEN_PID";
 const REBIND_SYSTEMD_PID: &str = "auto";
 
 /// Settings for graceful restarts
-#[derive(Clone, Debug, Deserialize)]
 pub struct RestartConfig {
     /// Enables the restart coordination socket for graceful restarts as an alternative to the SIGUSR1 signal.
     pub enabled: bool,
