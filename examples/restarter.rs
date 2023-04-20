@@ -41,6 +41,7 @@ async fn main() -> Result<(), Error> {
     let restart_conf = RestartConfig {
         enabled: true,
         coordination_socket_path: args.socket.into(),
+        ..Default::default()
     };
 
     match args.command {

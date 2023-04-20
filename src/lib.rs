@@ -101,6 +101,15 @@ impl RestartConfig {
     }
 }
 
+impl Default for RestartConfig {
+    fn default() -> Self {
+        RestartConfig {
+            enabled: false,
+            coordination_socket_path: Default::default(),
+        }
+    }
+}
+
 /// When the proxy restarts itself, it sets the child's LISTEN_PID env to a
 /// special value so that the child can replace it with the real child PID.
 /// Doing this is easier than reimplementing rust's process spawn code just so
