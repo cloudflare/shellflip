@@ -1,5 +1,5 @@
 //! Graceful restart management inspired by tableflip, but more basic.
-//! 
+//!
 //! To implement restarts, the simplest thing to do is to generate a `RestartConfig` from
 //! command-line values or hardcoded defaults, then call `RestartConfig::try_into_restart_task`. If
 //! you implement a restart command using unix sockets for interactive error reporting, call
@@ -14,21 +14,21 @@
 //! The process can also be restarted by sending it SIGUSR1. After any kind of restart request, the
 //! old process will terminate if the new process starts up successfully, otherwise it will
 //! continue if possible.
-//! 
+//!
 //! For coordinating graceful shutdown of the old process, see `ShutdownCoordinator` in the
 //! `shutdown` module.
-//! 
+//!
 //! # Restart thread
-//! 
+//!
 //! Process restarts are handled by a dedicated thread which is spawned when calling either
 //! `RestartConfig::try_into_restart_task` or `spawn_restart_task`. If you are dropping privileges,
 //! capabilities or using seccomp policies to limit the syscalls that can execute, it is a good
 //! idea to call the aforementioned functions before locking down the main & future child threads.
 //! You likely don't want the restart thread to have the same restrictions and limitations that may
 //! otherwise prevent you from calling execve() or doing certain I/O operations.
+mod pipes;
 pub mod restart_coordination_socket;
 pub mod shutdown;
-mod pipes;
 
 pub use shutdown::{ShutdownCoordinator, ShutdownHandle, ShutdownSignal};
 
@@ -119,7 +119,7 @@ pub fn fixup_systemd_env() {
 
 /// Notify systemd and the parent process (if any) that the proxy has started successfully.
 /// Returns an error if there was a parent process and we failed to notify it.
-/// 
+///
 /// This is usually called by the restart task returned from `RestartConfig::try_into_restart_task`
 /// but this function is available if indicating readiness needs to happen sooner or at a more
 /// convenient time then first polling the restart task.

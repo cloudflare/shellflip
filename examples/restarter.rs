@@ -2,15 +2,15 @@
 //! This implements a TCP server that accepts connections,
 //! outputs a short line describing the running process,
 //! then echoes back anything sent to it by the client.
-//! 
+//!
 //! While the application is running, another instance can be invoked with the
 //! `restart` command which will trigger a restart. Existing connections will be maintained and the
 //! old process will terminate as soon as all clients disconnect. The new process will listen on
 //! another socket (as this library does not provide for socket inheritance or rebinding).
-use clap::{Parser, Subcommand};
-use shellflip::{RestartConfig, ShutdownHandle, ShutdownCoordinator, ShutdownSignal};
-use std::sync::Arc;
 use anyhow::Error;
+use clap::{Parser, Subcommand};
+use shellflip::{RestartConfig, ShutdownCoordinator, ShutdownHandle, ShutdownSignal};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::{pin, select};
