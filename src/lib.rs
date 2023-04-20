@@ -73,7 +73,9 @@ pub struct RestartConfig {
 
 impl RestartConfig {
     /// Prepare the current process to handle restarts, if enabled.
-    pub fn try_into_restart_task(self) -> io::Result<(impl Future<Output = RestartResult<()>> + Send)> {
+    pub fn try_into_restart_task(
+        self,
+    ) -> io::Result<(impl Future<Output = RestartResult<process::Child>> + Send)> {
         fixup_systemd_env();
         spawn_restart_task(&self)
     }
@@ -159,7 +161,7 @@ impl RestartResponder {
 /// The child spawner thread needs to be created before seccomp locks down fork/exec.
 pub fn spawn_restart_task(
     settings: &RestartConfig,
-) -> io::Result<impl Future<Output = RestartResult<()>> + Send> {
+) -> io::Result<impl Future<Output = RestartResult<process::Child>> + Send> {
     let socket = match settings.enabled {
         true => Some(settings.coordination_socket_path.as_ref()),
         false => None,
@@ -178,19 +180,20 @@ pub fn spawn_restart_task(
             let res = child_spawner.spawn_new_process().await;
 
             responder
-                .respond(res.as_ref().map(|p| *p).map_err(|e| e.to_string()))
+                .respond(res.as_ref().map(|p| p.id()).map_err(|e| e.to_string()))
                 .await;
 
             match res {
-                Ok(pid) => {
-                    log::debug!("New process spawned with pid {}", pid);
+                Ok(child) => {
+                    log::debug!("New process spawned with pid {}", child.id());
 
-                    if let Err(e) = sd_notify::notify(true, &[sd_notify::NotifyState::MainPid(pid)])
+                    if let Err(e) =
+                        sd_notify::notify(true, &[sd_notify::NotifyState::MainPid(child.id())])
                     {
                         log::error!("Failed to notify systemd: {}", e);
                     }
 
-                    return Ok(());
+                    return Ok(child);
                 }
                 Err(ChildSpawnError::ChildError(e)) => {
                     log::error!("Restart failed: {}", e);
@@ -231,13 +234,13 @@ impl ChildSpawner {
 
     /// Spawn a process via IPC to the privileged thread.
     /// Returns the child pid on success.
-    async fn spawn_new_process(&mut self) -> Result<u32, ChildSpawnError> {
+    async fn spawn_new_process(&mut self) -> Result<process::Child, ChildSpawnError> {
         self.signal_sender
             .send(())
             .await
             .map_err(|_| ChildSpawnError::RestartThreadGone)?;
         match self.pid_receiver.recv().await {
-            Some(Ok(child)) => Ok(child.id()),
+            Some(Ok(child)) => Ok(child),
             Some(Err(e)) => Err(ChildSpawnError::ChildError(e)),
             None => Err(ChildSpawnError::RestartThreadGone),
         }

@@ -89,7 +89,7 @@ async fn main() -> Result<(), Error> {
             }
             res = &mut restart_task => {
                 match res {
-                    Ok(()) => {
+                    Ok(_) => {
                         log::info!("Restart successful, waiting for tasks to complete");
                     }
                     Err(e) => {
