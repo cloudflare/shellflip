@@ -1,20 +1,34 @@
 use libc::c_int;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd};
 
-/// Create a pair of pipes. The read end (first element) is not inheritable
-/// in child processes but the write end (second element) is.
-pub(crate) fn pipe_pair() -> io::Result<(CompletionReceiver, CompletionSender)> {
+pub(crate) enum PipeMode {
+    ParentWrites,
+    ChildWrites,
+}
+
+/// Create a pair of pipes.
+/// The first element is the read side, and the second element is the write side.
+/// `mode` determines whether the read or write end will be inherited by the child.
+pub(crate) fn create_paired_pipes(mode: PipeMode) -> io::Result<(File, File)> {
     let mut fds: [c_int; 2] = [0; 2];
     let res = unsafe { libc::pipe(fds.as_mut_ptr()) };
     if res != 0 {
         return Err(io::Error::last_os_error());
     }
-    set_cloexec(fds[0])?;
 
-    let reader = CompletionReceiver(unsafe { File::from_raw_fd(fds[0]) });
-    let writer = CompletionSender(unsafe { File::from_raw_fd(fds[1]) });
+    match mode {
+        PipeMode::ParentWrites => {
+            set_cloexec(fds[1])?;
+        }
+        PipeMode::ChildWrites => {
+            set_cloexec(fds[0])?;
+        }
+    };
+
+    let reader = unsafe { File::from_raw_fd(fds[0]) };
+    let writer = unsafe { File::from_raw_fd(fds[1]) };
 
     Ok((reader, writer))
 }
@@ -25,6 +39,15 @@ fn set_cloexec(fd: c_int) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+pub(crate) fn completion_pipes() -> io::Result<(CompletionReceiver, CompletionSender)> {
+    let (reader, writer) = create_paired_pipes(PipeMode::ChildWrites)?;
+
+    let reader = CompletionReceiver(reader);
+    let writer = CompletionSender(writer);
+
+    Ok((reader, writer))
 }
 
 pub(crate) struct CompletionReceiver(File);
@@ -44,23 +67,9 @@ impl CompletionReceiver {
     }
 }
 
-pub(crate) struct CompletionSender(File);
+pub(crate) struct CompletionSender(pub(crate) File);
 
 impl CompletionSender {
-    pub(crate) fn from_fd_string(fd_str: &str) -> io::Result<Self> {
-        match fd_str.parse() {
-            Ok(fd) => Ok(CompletionSender(unsafe { File::from_raw_fd(fd) })),
-            Err(_) => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid notify socket fd",
-            )),
-        }
-    }
-
-    pub(crate) fn fd_string(&self) -> String {
-        self.0.as_raw_fd().to_string()
-    }
-
     pub(crate) fn send(&mut self) -> io::Result<()> {
         if self.0.write(b"1")? != 1 {
             Err(io::Error::new(
@@ -70,5 +79,28 @@ impl CompletionSender {
         } else {
             Ok(())
         }
+    }
+}
+
+pub(crate) trait FdStringExt {
+    fn fd_string(&self) -> String;
+    fn from_fd_string(fd_str: &str) -> io::Result<Self>
+    where
+        Self: Sized;
+}
+
+impl<T: AsRawFd + FromRawFd> FdStringExt for T {
+    fn from_fd_string(fd_str: &str) -> io::Result<Self> {
+        match fd_str.parse() {
+            Ok(fd) => Ok(unsafe { Self::from_raw_fd(fd) }),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid notify socket fd",
+            )),
+        }
+    }
+
+    fn fd_string(&self) -> String {
+        self.as_raw_fd().to_string()
     }
 }
