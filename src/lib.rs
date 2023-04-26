@@ -60,7 +60,7 @@ use std::ffi::OsString;
 use std::fs::remove_file;
 use std::future::Future;
 use std::io;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -254,7 +254,7 @@ struct ChildSpawner {
 impl ChildSpawner {
     /// Create a ChildSpawner that will pass restart_fd to child processes.
     fn new(
-        restart_fd: Option<RawFd>,
+        restart_fd: Option<OwnedFd>,
         environment: Vec<(OsString, OsString)>,
         mut lifecycle_handler: Box<dyn LifecycleHandler>,
     ) -> Self {
@@ -262,6 +262,8 @@ impl ChildSpawner {
         let (pid_sender, pid_receiver) = channel(1);
 
         thread::spawn(move || {
+            let restart_fd = restart_fd.as_ref().map(OwnedFd::as_fd);
+
             while let Some(()) = signal_receiver.blocking_recv() {
                 let child = tokio::runtime::Runtime::new()
                     .unwrap()
@@ -329,34 +331,27 @@ async fn next_restart_request(
 
 fn new_restart_coordination_socket_stream(
     restart_coordination_socket: Option<&Path>,
-) -> io::Result<(Option<RawFd>, impl Stream<Item = RestartResponder>)> {
+) -> io::Result<(Option<OwnedFd>, impl Stream<Item = RestartResponder>)> {
     if let Some(path) = restart_coordination_socket {
         let listener = bind_restart_coordination_socket(path)?;
-        let fd = listener.as_raw_fd();
+        let inherit_socket = OwnedFd::from(listener.try_clone()?);
+        let listener = UnixListener::from_std(listener)?;
         let st = listen_for_restart_events(listener);
-        Ok((Some(fd), st.boxed()))
+        Ok((Some(inherit_socket), st.boxed()))
     } else {
         Ok((None, futures::stream::pending().boxed()))
     }
 }
 
-fn bind_restart_coordination_socket(path: &Path) -> io::Result<UnixListener> {
+fn bind_restart_coordination_socket(path: &Path) -> io::Result<StdUnixListener> {
     match env::var(ENV_RESTART_SOCKET) {
         Err(_) => {
             // This may fail but binding will succeed despite that. If binding fails,
             // that's the error we really care about.
             let _ = remove_file(path);
-            UnixListener::bind(path)
+            StdUnixListener::bind(path)
         }
-        Ok(maybe_sock_fd) => match maybe_sock_fd.parse() {
-            Ok(fd) => {
-                Ok(UnixListener::from_std(unsafe { StdUnixListener::from_raw_fd(fd) }).unwrap())
-            }
-            Err(_) => Err(io::Error::new(
-                io::ErrorKind::Other,
-                "inherited restart coordination socket is not an fd",
-            )),
-        },
+        Ok(maybe_sock_fd) => unsafe { StdUnixListener::from_fd_string(&maybe_sock_fd) },
     }
 }
 
@@ -403,7 +398,7 @@ fn clear_cloexec(fd: RawFd) -> nix::Result<()> {
 
 /// Attempt to start a new instance of this proxy.
 async fn spawn_child(
-    restart_fd: Option<RawFd>,
+    restart_fd: Option<BorrowedFd<'_>>,
     user_envs: &[(OsString, OsString)],
     lifecycle_handler: &mut dyn LifecycleHandler,
 ) -> io::Result<process::Child> {
@@ -425,6 +420,7 @@ async fn spawn_child(
 
     if let Some(fd) = restart_fd {
         // Let the child inherit the restart coordination socket
+        let fd = fd.as_raw_fd();
         unsafe {
             cmd.env(ENV_RESTART_SOCKET, fd.to_string())
                 .pre_exec(move || {
