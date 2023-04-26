@@ -143,7 +143,7 @@ mod tests {
 
         // Shutdown is delayed with an active task
         let sc = ShutdownCoordinator::new();
-        let handle = sc.handle().upgrade().unwrap();
+        let handle = sc.handle();
         let shutdown_fut = sc.shutdown();
         pin_mut!(shutdown_fut);
         assert!(shutdown_fut.as_mut().now_or_never().is_none());
