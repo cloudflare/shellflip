@@ -84,15 +84,15 @@ impl CompletionSender {
 
 pub(crate) trait FdStringExt {
     fn fd_string(&self) -> String;
-    fn from_fd_string(fd_str: &str) -> io::Result<Self>
+    unsafe fn from_fd_string(fd_str: &str) -> io::Result<Self>
     where
         Self: Sized;
 }
 
 impl<T: AsRawFd + FromRawFd> FdStringExt for T {
-    fn from_fd_string(fd_str: &str) -> io::Result<Self> {
+    unsafe fn from_fd_string(fd_str: &str) -> io::Result<Self> {
         match fd_str.parse() {
-            Ok(fd) => Ok(unsafe { Self::from_raw_fd(fd) }),
+            Ok(fd) => Ok(Self::from_raw_fd(fd)),
             Err(_) => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "invalid notify socket fd",

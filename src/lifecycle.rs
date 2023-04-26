@@ -31,9 +31,13 @@ impl LifecycleHandler for NullLifecycleHandler {}
 
 /// If this process has been spawned due to graceful restart, returns a `PipeReader` used to receive
 /// data from the parent process's implementation of `LifecycleHandler::send_to_new_process`.
+///
+/// The behaviour of this function is undefined if the environment variables used by this crate to
+/// pass file descriptor numbers were set by something other than shellflip spawning a new instance
+/// of the calling process.
 pub fn receive_from_old_process() -> Option<PipeReader> {
     if let Ok(handover_fd) = env::var(ENV_HANDOVER_PIPE) {
-        File::from_fd_string(&handover_fd)
+        unsafe { File::from_fd_string(&handover_fd) }
             .ok()
             .map(|x| Box::pin(x) as PipeReader)
     } else {

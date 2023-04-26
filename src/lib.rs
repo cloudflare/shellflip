@@ -157,9 +157,13 @@ pub fn fixup_systemd_env() {
 /// This is usually called by the restart task returned from `RestartConfig::try_into_restart_task`
 /// but this function is available if indicating readiness needs to happen sooner or at a more
 /// convenient time then first polling the restart task.
+///
+/// The behaviour of this function is undefined if the environment variables used by this crate to
+/// pass file descriptor numbers were set by something other than shellflip spawning a new instance
+/// of the calling process.
 pub fn startup_complete() -> io::Result<()> {
     if let Ok(notify_fd) = env::var(ENV_NOTIFY_SOCKET) {
-        pipes::CompletionSender(std::fs::File::from_fd_string(&notify_fd)?).send()?;
+        pipes::CompletionSender(unsafe { std::fs::File::from_fd_string(&notify_fd)? }).send()?;
     }
     // Avoid sending twice on the notification pipe, if this is manually called outside
     // of the restart task.
