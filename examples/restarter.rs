@@ -2,15 +2,17 @@
 //! This implements a TCP server that accepts connections,
 //! outputs a short line describing the running process,
 //! then echoes back anything sent to it by the client.
-//! 
+//!
 //! While the application is running, another instance can be invoked with the
 //! `restart` command which will trigger a restart. Existing connections will be maintained and the
 //! old process will terminate as soon as all clients disconnect. The new process will listen on
 //! another socket (as this library does not provide for socket inheritance or rebinding).
-use clap::{Parser, Subcommand};
-use shellflip::{RestartConfig, ShutdownHandle, ShutdownCoordinator, ShutdownSignal};
-use std::sync::Arc;
 use anyhow::Error;
+use async_trait::async_trait;
+use clap::{Parser, Subcommand};
+use shellflip::lifecycle::*;
+use shellflip::{RestartConfig, ShutdownCoordinator, ShutdownHandle, ShutdownSignal};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::{pin, select};
@@ -32,15 +34,45 @@ enum Commands {
     Restart,
 }
 
+struct AppData {
+    restart_generation: u32,
+}
+
+#[async_trait]
+impl LifecycleHandler for AppData {
+    async fn send_to_new_process(&mut self, mut write_pipe: PipeWriter) -> std::io::Result<()> {
+        if self.restart_generation > 4 {
+            log::info!("Four restarts is more than anybody needs, surely?");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "The operation completed successfully",
+            ));
+        }
+        write_pipe.write_u32(self.restart_generation).await?;
+        Ok(())
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     env_logger::init();
     let args = Args::parse();
+    let mut app_data = AppData {
+        restart_generation: 0,
+    };
+
+    if let Some(mut handover_pipe) = receive_from_old_process() {
+        app_data.restart_generation = handover_pipe.read_u32().await? + 1;
+    }
+
+    let restart_generation = app_data.restart_generation;
 
     // Configure the essential requirements for implementing graceful restart.
     let restart_conf = RestartConfig {
         enabled: true,
         coordination_socket_path: args.socket.into(),
+        lifecycle_handler: Box::new(app_data),
+        ..Default::default()
     };
 
     match args.command {
@@ -70,7 +102,11 @@ async fn main() -> Result<(), Error> {
     let shutdown_coordinator = ShutdownCoordinator::new();
     // Bind a TCP listener socket to give us something to do
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    println!("Listening on {}", listener.local_addr().unwrap());
+    println!(
+        "Instance no. {} listening on {}",
+        restart_generation,
+        listener.local_addr().unwrap()
+    );
 
     loop {
         select! {
@@ -89,7 +125,7 @@ async fn main() -> Result<(), Error> {
             }
             res = &mut restart_task => {
                 match res {
-                    Ok(()) => {
+                    Ok(_) => {
                         log::info!("Restart successful, waiting for tasks to complete");
                     }
                     Err(e) => {

@@ -1,5 +1,5 @@
 //! Graceful restart management inspired by tableflip, but more basic.
-//! 
+//!
 //! To implement restarts, the simplest thing to do is to generate a `RestartConfig` from
 //! command-line values or hardcoded defaults, then call `RestartConfig::try_into_restart_task`. If
 //! you implement a restart command using unix sockets for interactive error reporting, call
@@ -14,41 +14,60 @@
 //! The process can also be restarted by sending it SIGUSR1. After any kind of restart request, the
 //! old process will terminate if the new process starts up successfully, otherwise it will
 //! continue if possible.
-//! 
+//!
 //! For coordinating graceful shutdown of the old process, see `ShutdownCoordinator` in the
 //! `shutdown` module.
-//! 
+//!
 //! # Restart thread
-//! 
+//!
 //! Process restarts are handled by a dedicated thread which is spawned when calling either
 //! `RestartConfig::try_into_restart_task` or `spawn_restart_task`. If you are dropping privileges,
 //! capabilities or using seccomp policies to limit the syscalls that can execute, it is a good
 //! idea to call the aforementioned functions before locking down the main & future child threads.
 //! You likely don't want the restart thread to have the same restrictions and limitations that may
 //! otherwise prevent you from calling execve() or doing certain I/O operations.
+//!
+//! # Transferring state to the new process
+//!
+//! It is possible for the old process to serialise state and send it to the new process to
+//! continue processing. Your code must set an implementation of `LifecycleHandler` on the
+//! `RestartConfig`. After a new process is spawned, shellflip will call
+//! `LifecycleHandler::send_to_new_process` which gives you a unidirectional pipe to write data to
+//! the new process, which receives this data by calling the `receive_from_old_process` function.
+//!
+//! The data should be received and validated by the new process before it signals readiness by
+//! polling the restart task, in case the data is unusable e.g. if the data format changed slightly
+//! between versions causing serialisation to fail. If the new process fails to signal readiness,
+//! `LifecycleHandler::new_process_failed` is called and you can undo any changes you made in
+//! preparation for handover. If the new process succeeds, however, the restart task will resolve
+//! and you may terminate the process as usual.
+pub mod lifecycle;
+mod pipes;
 pub mod restart_coordination_socket;
 pub mod shutdown;
-mod pipes;
 
 pub use shutdown::{ShutdownCoordinator, ShutdownHandle, ShutdownSignal};
 
+use crate::lifecycle::LifecycleHandler;
+use crate::pipes::{completion_pipes, create_paired_pipes, FdStringExt, PipeMode};
 use crate::restart_coordination_socket::{
     RestartCoordinationSocket, RestartMessage, RestartRequest, RestartResponse,
 };
 use anyhow::anyhow;
 use futures::stream::{Stream, StreamExt};
-use serde::Deserialize;
 use std::env;
+use std::ffi::OsString;
 use std::fs::remove_file;
 use std::future::Future;
 use std::io;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::thread;
 use thiserror::Error;
+use tokio::fs::File;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::select;
 use tokio::signal::unix::{signal, Signal, SignalKind};
@@ -59,23 +78,29 @@ pub type RestartResult<T> = anyhow::Result<T>;
 
 const ENV_NOTIFY_SOCKET: &str = "OXY_NOTIFY_SOCKET";
 const ENV_RESTART_SOCKET: &str = "OXY_RESTART_SOCKET";
+const ENV_HANDOVER_PIPE: &str = "OXY_HANDOVER_PIPE";
 const ENV_SYSTEMD_PID: &str = "LISTEN_PID";
 const REBIND_SYSTEMD_PID: &str = "auto";
 
 /// Settings for graceful restarts
-#[derive(Clone, Debug, Deserialize)]
 pub struct RestartConfig {
     /// Enables the restart coordination socket for graceful restarts as an alternative to the SIGUSR1 signal.
     pub enabled: bool,
     /// Socket path
     pub coordination_socket_path: PathBuf,
+    /// Sets environment variables on the newly-started process
+    pub environment: Vec<(OsString, OsString)>,
+    /// Receive fine-grained events on the lifecycle of the new process and support data transfer.
+    pub lifecycle_handler: Box<dyn LifecycleHandler>,
 }
 
 impl RestartConfig {
     /// Prepare the current process to handle restarts, if enabled.
-    pub fn try_into_restart_task(self) -> io::Result<(impl Future<Output = RestartResult<()>> + Send)> {
+    pub fn try_into_restart_task(
+        self,
+    ) -> io::Result<(impl Future<Output = RestartResult<process::Child>> + Send)> {
         fixup_systemd_env();
-        spawn_restart_task(&self)
+        spawn_restart_task(self)
     }
 
     /// Request an already-running service to restart.
@@ -101,6 +126,17 @@ impl RestartConfig {
     }
 }
 
+impl Default for RestartConfig {
+    fn default() -> Self {
+        RestartConfig {
+            enabled: false,
+            coordination_socket_path: Default::default(),
+            environment: vec![],
+            lifecycle_handler: Box::new(lifecycle::NullLifecycleHandler),
+        }
+    }
+}
+
 /// When the proxy restarts itself, it sets the child's LISTEN_PID env to a
 /// special value so that the child can replace it with the real child PID.
 /// Doing this is easier than reimplementing rust's process spawn code just so
@@ -117,13 +153,17 @@ pub fn fixup_systemd_env() {
 
 /// Notify systemd and the parent process (if any) that the proxy has started successfully.
 /// Returns an error if there was a parent process and we failed to notify it.
-/// 
+///
 /// This is usually called by the restart task returned from `RestartConfig::try_into_restart_task`
 /// but this function is available if indicating readiness needs to happen sooner or at a more
 /// convenient time then first polling the restart task.
+///
+/// The behaviour of this function is undefined if the environment variables used by this crate to
+/// pass file descriptor numbers were set by something other than shellflip spawning a new instance
+/// of the calling process.
 pub fn startup_complete() -> io::Result<()> {
     if let Ok(notify_fd) = env::var(ENV_NOTIFY_SOCKET) {
-        pipes::CompletionSender::from_fd_string(&notify_fd)?.send()?;
+        pipes::CompletionSender(unsafe { std::fs::File::from_fd_string(&notify_fd)? }).send()?;
     }
     // Avoid sending twice on the notification pipe, if this is manually called outside
     // of the restart task.
@@ -158,8 +198,8 @@ impl RestartResponder {
 /// becomes impossible.
 /// The child spawner thread needs to be created before seccomp locks down fork/exec.
 pub fn spawn_restart_task(
-    settings: &RestartConfig,
-) -> io::Result<impl Future<Output = RestartResult<()>> + Send> {
+    settings: RestartConfig,
+) -> io::Result<impl Future<Output = RestartResult<process::Child>> + Send> {
     let socket = match settings.enabled {
         true => Some(settings.coordination_socket_path.as_ref()),
         false => None,
@@ -167,7 +207,8 @@ pub fn spawn_restart_task(
 
     let mut signal_stream = signal(SignalKind::user_defined1())?;
     let (restart_fd, mut socket_stream) = new_restart_coordination_socket_stream(socket)?;
-    let mut child_spawner = ChildSpawner::new(restart_fd);
+    let mut child_spawner =
+        ChildSpawner::new(restart_fd, settings.environment, settings.lifecycle_handler);
 
     Ok(async move {
         startup_complete()?;
@@ -178,19 +219,20 @@ pub fn spawn_restart_task(
             let res = child_spawner.spawn_new_process().await;
 
             responder
-                .respond(res.as_ref().map(|p| *p).map_err(|e| e.to_string()))
+                .respond(res.as_ref().map(|p| p.id()).map_err(|e| e.to_string()))
                 .await;
 
             match res {
-                Ok(pid) => {
-                    log::debug!("New process spawned with pid {}", pid);
+                Ok(child) => {
+                    log::debug!("New process spawned with pid {}", child.id());
 
-                    if let Err(e) = sd_notify::notify(true, &[sd_notify::NotifyState::MainPid(pid)])
+                    if let Err(e) =
+                        sd_notify::notify(true, &[sd_notify::NotifyState::MainPid(child.id())])
                     {
                         log::error!("Failed to notify systemd: {}", e);
                     }
 
-                    return Ok(());
+                    return Ok(child);
                 }
                 Err(ChildSpawnError::ChildError(e)) => {
                     log::error!("Restart failed: {}", e);
@@ -211,14 +253,28 @@ struct ChildSpawner {
 
 impl ChildSpawner {
     /// Create a ChildSpawner that will pass restart_fd to child processes.
-    fn new(restart_fd: Option<RawFd>) -> Self {
+    fn new(
+        restart_fd: Option<OwnedFd>,
+        environment: Vec<(OsString, OsString)>,
+        mut lifecycle_handler: Box<dyn LifecycleHandler>,
+    ) -> Self {
         let (signal_sender, mut signal_receiver) = channel(1);
         let (pid_sender, pid_receiver) = channel(1);
 
         thread::spawn(move || {
+            let restart_fd = restart_fd.as_ref().map(OwnedFd::as_fd);
+
             while let Some(()) = signal_receiver.blocking_recv() {
+                let child = tokio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(spawn_child(
+                        restart_fd,
+                        &environment,
+                        &mut *lifecycle_handler,
+                    ));
+
                 pid_sender
-                    .blocking_send(spawn_child(restart_fd))
+                    .blocking_send(child)
                     .expect("parent needs to receive the child");
             }
         });
@@ -231,13 +287,13 @@ impl ChildSpawner {
 
     /// Spawn a process via IPC to the privileged thread.
     /// Returns the child pid on success.
-    async fn spawn_new_process(&mut self) -> Result<u32, ChildSpawnError> {
+    async fn spawn_new_process(&mut self) -> Result<process::Child, ChildSpawnError> {
         self.signal_sender
             .send(())
             .await
             .map_err(|_| ChildSpawnError::RestartThreadGone)?;
         match self.pid_receiver.recv().await {
-            Some(Ok(child)) => Ok(child.id()),
+            Some(Ok(child)) => Ok(child),
             Some(Err(e)) => Err(ChildSpawnError::ChildError(e)),
             None => Err(ChildSpawnError::RestartThreadGone),
         }
@@ -275,34 +331,27 @@ async fn next_restart_request(
 
 fn new_restart_coordination_socket_stream(
     restart_coordination_socket: Option<&Path>,
-) -> io::Result<(Option<RawFd>, impl Stream<Item = RestartResponder>)> {
+) -> io::Result<(Option<OwnedFd>, impl Stream<Item = RestartResponder>)> {
     if let Some(path) = restart_coordination_socket {
         let listener = bind_restart_coordination_socket(path)?;
-        let fd = listener.as_raw_fd();
+        let inherit_socket = OwnedFd::from(listener.try_clone()?);
+        let listener = UnixListener::from_std(listener)?;
         let st = listen_for_restart_events(listener);
-        Ok((Some(fd), st.boxed()))
+        Ok((Some(inherit_socket), st.boxed()))
     } else {
         Ok((None, futures::stream::pending().boxed()))
     }
 }
 
-fn bind_restart_coordination_socket(path: &Path) -> io::Result<UnixListener> {
+fn bind_restart_coordination_socket(path: &Path) -> io::Result<StdUnixListener> {
     match env::var(ENV_RESTART_SOCKET) {
         Err(_) => {
             // This may fail but binding will succeed despite that. If binding fails,
             // that's the error we really care about.
             let _ = remove_file(path);
-            UnixListener::bind(path)
+            StdUnixListener::bind(path)
         }
-        Ok(maybe_sock_fd) => match maybe_sock_fd.parse() {
-            Ok(fd) => {
-                Ok(UnixListener::from_std(unsafe { StdUnixListener::from_raw_fd(fd) }).unwrap())
-            }
-            Err(_) => Err(io::Error::new(
-                io::ErrorKind::Other,
-                "inherited restart coordination socket is not an fd",
-            )),
-        },
+        Ok(maybe_sock_fd) => unsafe { StdUnixListener::from_fd_string(&maybe_sock_fd) },
     }
 }
 
@@ -348,19 +397,30 @@ fn clear_cloexec(fd: RawFd) -> nix::Result<()> {
 }
 
 /// Attempt to start a new instance of this proxy.
-fn spawn_child(restart_fd: Option<RawFd>) -> io::Result<process::Child> {
+async fn spawn_child(
+    restart_fd: Option<BorrowedFd<'_>>,
+    user_envs: &[(OsString, OsString)],
+    lifecycle_handler: &mut dyn LifecycleHandler,
+) -> io::Result<process::Child> {
     let mut args = env::args();
     let process_name = args.next().unwrap();
 
     // Create a pipe for the child to notify us on successful startup
-    let (mut notif_r, notif_w) = pipes::pipe_pair()?;
+    let (mut notif_r, notif_w) = completion_pipes()?;
+
+    // And another pair of pipes to hand over data to the child process.
+    let (handover_r, handover_w) = create_paired_pipes(PipeMode::ParentWrites)?;
 
     let mut cmd = process::Command::new(process_name);
     cmd.args(args)
+        .envs(user_envs.iter().map(|(k, v)| (k, v)))
         .env(ENV_SYSTEMD_PID, REBIND_SYSTEMD_PID)
-        .env(ENV_NOTIFY_SOCKET, notif_w.fd_string());
+        .env(ENV_HANDOVER_PIPE, handover_r.fd_string())
+        .env(ENV_NOTIFY_SOCKET, notif_w.0.fd_string());
+
     if let Some(fd) = restart_fd {
         // Let the child inherit the restart coordination socket
+        let fd = fd.as_raw_fd();
         unsafe {
             cmd.env(ENV_RESTART_SOCKET, fd.to_string())
                 .pre_exec(move || {
@@ -371,8 +431,17 @@ fn spawn_child(restart_fd: Option<RawFd>) -> io::Result<process::Child> {
     }
     let child = cmd.spawn()?;
 
+    lifecycle_handler
+        .send_to_new_process(Box::pin(File::from(handover_w)))
+        .await?;
+
     // only the child needs the write end
     drop(notif_w);
-    notif_r.recv()?;
-    Ok(child)
+    match notif_r.recv() {
+        Ok(_) => Ok(child),
+        Err(e) => {
+            lifecycle_handler.new_process_failed().await;
+            Err(e)
+        }
+    }
 }
