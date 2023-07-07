@@ -49,7 +49,10 @@ pub mod shutdown;
 pub use shutdown::{ShutdownCoordinator, ShutdownHandle, ShutdownSignal};
 
 use crate::lifecycle::LifecycleHandler;
-use crate::pipes::{completion_pipes, create_paired_pipes, FdStringExt, PipeMode};
+use crate::pipes::{
+    completion_pipes, create_paired_pipes, CompletionReceiver, CompletionSender, FdStringExt,
+    PipeMode,
+};
 use crate::restart_coordination_socket::{
     RestartCoordinationSocket, RestartMessage, RestartRequest, RestartResponse,
 };
@@ -57,7 +60,7 @@ use anyhow::anyhow;
 use futures::stream::{Stream, StreamExt};
 use std::env;
 use std::ffi::OsString;
-use std::fs::remove_file;
+use std::fs::{remove_file, File as StdFile};
 use std::future::Future;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
@@ -92,6 +95,8 @@ pub struct RestartConfig {
     pub environment: Vec<(OsString, OsString)>,
     /// Receive fine-grained events on the lifecycle of the new process and support data transfer.
     pub lifecycle_handler: Box<dyn LifecycleHandler>,
+    /// Exits early when child process fail to start
+    pub exit_on_error: bool,
 }
 
 impl RestartConfig {
@@ -133,6 +138,7 @@ impl Default for RestartConfig {
             coordination_socket_path: Default::default(),
             environment: vec![],
             lifecycle_handler: Box::new(lifecycle::NullLifecycleHandler),
+            exit_on_error: true,
         }
     }
 }
@@ -235,7 +241,11 @@ pub fn spawn_restart_task(
                     return Ok(child);
                 }
                 Err(ChildSpawnError::ChildError(e)) => {
-                    log::error!("Restart failed: {}", e);
+                    if settings.exit_on_error {
+                        return Err(anyhow!("Restart failed: {}", e));
+                    } else {
+                        log::error!("Restart failed: {}", e);
+                    }
                 }
                 Err(ChildSpawnError::RestartThreadGone) => {
                     res?;
@@ -406,7 +416,7 @@ async fn spawn_child(
     let process_name = args.next().unwrap();
 
     // Create a pipe for the child to notify us on successful startup
-    let (mut notif_r, notif_w) = completion_pipes()?;
+    let (notif_r, notif_w) = completion_pipes()?;
 
     // And another pair of pipes to hand over data to the child process.
     let (handover_r, handover_w) = create_paired_pipes(PipeMode::ParentWrites)?;
@@ -429,8 +439,26 @@ async fn spawn_child(
                 });
         }
     }
-    let child = cmd.spawn()?;
+    let mut child = cmd.spawn()?;
 
+    if let Err(e) = send_parent_state(lifecycle_handler, notif_r, notif_w, handover_w).await {
+        if child.kill().is_err() {
+            log::error!("Child process has already exited. Failed to send parent state: {e:?}");
+        } else {
+            log::error!("Killed child process because failed to send parent state: {e:?}");
+        }
+        return Err(e);
+    }
+
+    Ok(child)
+}
+
+async fn send_parent_state(
+    lifecycle_handler: &mut dyn LifecycleHandler,
+    mut notif_r: CompletionReceiver,
+    notif_w: CompletionSender,
+    handover_w: StdFile,
+) -> io::Result<()> {
     lifecycle_handler
         .send_to_new_process(Box::pin(File::from(handover_w)))
         .await?;
@@ -438,7 +466,7 @@ async fn spawn_child(
     // only the child needs the write end
     drop(notif_w);
     match notif_r.recv() {
-        Ok(_) => Ok(child),
+        Ok(_) => Ok(()),
         Err(e) => {
             lifecycle_handler.new_process_failed().await;
             Err(e)
