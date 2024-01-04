@@ -87,7 +87,7 @@ const REBIND_SYSTEMD_PID: &str = "auto";
 
 /// Settings for graceful restarts
 pub struct RestartConfig {
-    /// Enables the restart coordination socket for graceful restarts as an alternative to the SIGUSR1 signal.
+    /// Enables the restart coordination socket for graceful restarts as an alternative to a Unix signal.
     pub enabled: bool,
     /// Socket path
     pub coordination_socket_path: PathBuf,
@@ -97,6 +97,8 @@ pub struct RestartConfig {
     pub lifecycle_handler: Box<dyn LifecycleHandler>,
     /// Exits early when child process fail to start
     pub exit_on_error: bool,
+    /// Sets the signal to listen to on restart. This defaults to SIGUSR1.
+    pub restart_signal: SignalKind,
 }
 
 impl RestartConfig {
@@ -139,6 +141,7 @@ impl Default for RestartConfig {
             environment: vec![],
             lifecycle_handler: Box::new(lifecycle::NullLifecycleHandler),
             exit_on_error: true,
+            restart_signal: SignalKind::user_defined1(),
         }
     }
 }
@@ -211,7 +214,7 @@ pub fn spawn_restart_task(
         false => None,
     };
 
-    let mut signal_stream = signal(SignalKind::user_defined1())?;
+    let mut signal_stream = signal(settings.restart_signal)?;
     let (restart_fd, mut socket_stream) = new_restart_coordination_socket_stream(socket)?;
     let mut child_spawner =
         ChildSpawner::new(restart_fd, settings.environment, settings.lifecycle_handler);
