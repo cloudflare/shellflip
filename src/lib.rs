@@ -93,19 +93,18 @@ pub struct RestartConfig {
     pub coordination_socket_path: PathBuf,
     /// Sets environment variables on the newly-started process
     pub environment: Vec<(OsString, OsString)>,
-    /// Receive fine-grained events on the lifecycle of the new process and support data transfer.
-    pub lifecycle_handler: Box<dyn LifecycleHandler>,
     /// Exits early when child process fail to start
     pub exit_on_error: bool,
 }
 
 impl RestartConfig {
     /// Prepare the current process to handle restarts, if enabled.
-    pub fn try_into_restart_task(
+    pub fn try_into_restart_task<L: LifecycleHandler + 'static>(
         self,
+        lifecycle_handler: L,
     ) -> io::Result<(impl Future<Output = RestartResult<process::Child>> + Send)> {
         fixup_systemd_env();
-        spawn_restart_task(self)
+        spawn_restart_task(self, Box::new(lifecycle_handler))
     }
 
     /// Request an already-running service to restart.
@@ -137,7 +136,6 @@ impl Default for RestartConfig {
             enabled: false,
             coordination_socket_path: Default::default(),
             environment: vec![],
-            lifecycle_handler: Box::new(lifecycle::NullLifecycleHandler),
             exit_on_error: true,
         }
     }
@@ -205,6 +203,7 @@ impl RestartResponder {
 /// The child spawner thread needs to be created before seccomp locks down fork/exec.
 pub fn spawn_restart_task(
     settings: RestartConfig,
+    lifecycle_handler: Box<dyn LifecycleHandler>,
 ) -> io::Result<impl Future<Output = RestartResult<process::Child>> + Send> {
     let socket = match settings.enabled {
         true => Some(settings.coordination_socket_path.as_ref()),
@@ -213,8 +212,7 @@ pub fn spawn_restart_task(
 
     let mut signal_stream = signal(SignalKind::user_defined1())?;
     let (restart_fd, mut socket_stream) = new_restart_coordination_socket_stream(socket)?;
-    let mut child_spawner =
-        ChildSpawner::new(restart_fd, settings.environment, settings.lifecycle_handler);
+    let mut child_spawner = ChildSpawner::new(restart_fd, settings.environment, lifecycle_handler);
 
     Ok(async move {
         startup_complete()?;
