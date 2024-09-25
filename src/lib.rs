@@ -412,6 +412,8 @@ async fn spawn_child(
     user_envs: &[(OsString, OsString)],
     lifecycle_handler: &mut dyn LifecycleHandler,
 ) -> io::Result<process::Child> {
+    lifecycle_handler.pre_new_process().await;
+
     let mut args = env::args();
     let process_name = args.next().unwrap();
 
