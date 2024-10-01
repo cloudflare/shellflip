@@ -1,0 +1,18 @@
+[package]
+name = "basic"
+version = "0.1.0"
+edition = "2021"
+description = "Basic test binary"
+
+[workspace]
+
+[dependencies]
+shellflip = { path = "../.." }
+async-trait = "0.1.61"
+anyhow = "1.0.56"
+futures = "0.3"
+tokio = { version = "1.24.1", features = ["full", "test-util"] }
+clap = { version = "4.1.8", features = ["derive"] }
+
+[patch.crates-io]
+sd-notify = { git = "https://github.com/cbranch/sd-notify.git", rev = "b80e6eb18cb64a18015f59dcf182284ffe96fdf8" }
