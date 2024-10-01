@@ -19,6 +19,9 @@ pub trait LifecycleHandler: Send {
         Ok(())
     }
 
+    /// Called before the child process has been spawned.
+    async fn pre_new_process(&mut self) {}
+
     /// Called after `send_to_new_process` if the child process fails to start successfully.
     /// This gives you an opportunity to undo any state changes made in `send_to_new_process`.
     async fn new_process_failed(&mut self) {}
