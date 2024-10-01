@@ -344,6 +344,7 @@ fn new_restart_coordination_socket_stream(
 ) -> io::Result<(Option<OwnedFd>, impl Stream<Item = RestartResponder>)> {
     if let Some(path) = restart_coordination_socket {
         let listener = bind_restart_coordination_socket(path)?;
+        listener.set_nonblocking(true)?;
         let inherit_socket = OwnedFd::from(listener.try_clone()?);
         let listener = UnixListener::from_std(listener)?;
         let st = listen_for_restart_events(listener);
