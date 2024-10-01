@@ -27,6 +27,30 @@ The main struct of interest is `RestartConfig` which has methods for detecting o
 restart. For shutting down a restarted process, the `ShutdownCoordinator` provides the means for
 both signalling a shutdown event to spawned tasks, and awaiting their completion.
 
+## Using shellflip with systemd
+
+If you are running your process as a systemd service, you may use shellflip to fork a new instance
+of the process. This allows you to upgrade the binary or apply new configuration, but you cannot
+change the environment or any systemd-set configuration without stopping the service completely.
+
+If this is insufficient for your needs, shellflip has an alternative runtime model that works with
+systemd's process management model. When issuing a `systemctl restart` or using the restart
+coordination socket, shellflip can pass data intended for the new process to systemd, then receive
+that data in the newly started instance. This requires systemd's file descriptor store to be
+enabled; an example `.service` file can be found in the `examples/` directory, or you may test it as
+a one-off command using `systemd-run`:
+
+`systemd-run -p FileDescriptorStoreMax=4096 target/debug/examples/restarter --systemd`
+
+The limitations of systemd's process management remain; the old process must terminate before the
+new process can start, so all tasks must end promptly and any child processes must terminate or
+accept being ungracefully killed when the parent terminates.
+
+If you need to prevent restarting the service if the service cannot successfully serialize its
+state, use ExecReload and the restart coordination socket like the non-systemd-aware shellflip mode.
+Make sure that systemd restarts your service on successful exit and/or force your service to
+terminate with a non-zero error code on restart.
+
 ## License
 
 BSD licensed. See the [LICENSE](LICENSE) file for details.

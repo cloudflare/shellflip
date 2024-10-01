@@ -40,7 +40,7 @@ struct AppData {
 
 #[async_trait]
 impl LifecycleHandler for AppData {
-    async fn send_to_new_process(&mut self, mut write_pipe: PipeWriter) -> std::io::Result<()> {
+    async fn send_to_new_process(&mut self, mut write_pipe: PipeWriter<'_>) -> std::io::Result<()> {
         if self.restart_generation > 4 {
             log::info!("Four restarts is more than anybody needs, surely?");
             return Err(std::io::Error::new(

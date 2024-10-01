@@ -15,16 +15,20 @@ anyhow = "1.0.56"
 futures = "0.3"
 libc = "0.2.76"
 log = "0.4.17"
+memfile = "0.3.1"
 nix = "0.25"
-sd-notify = "0.3"
+sd-notify = { version = "0.4.1", features = ["fdstore"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1.0"
 thiserror = "1.0"
 tokio = { version = "1.24.1", features = ["full", "test-util"] }
-tokio-stream = { version = "0.1", features = ["net", "io-util" ] }
+tokio-stream = { version = "0.1", features = ["net", "io-util"] }
 tokio-util = { version = "0.7.4", features = ["compat", "time", "codec"] }
 
 [dev-dependencies]
 clap = { version = "4.1.8", features = ["derive"] }
 env_logger = "0.10.0"
 rand = { version = "0.8", features = ["small_rng"] }
+
+[patch.crates-io]
+sd-notify = { git = "https://github.com/cbranch/sd-notify.git", rev = "b80e6eb18cb64a18015f59dcf182284ffe96fdf8" }
