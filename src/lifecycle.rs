@@ -8,14 +8,14 @@ use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 pub type PipeReader = Pin<Box<dyn AsyncRead + Send>>;
-pub type PipeWriter = Pin<Box<dyn AsyncWrite + Send>>;
+pub type PipeWriter<'a> = Pin<&'a mut (dyn AsyncWrite + Send)>;
 
 #[async_trait]
 pub trait LifecycleHandler: Send {
     /// Called after the child process has been spawned, allowing the current process to send state
     /// to the child process. The child process can receive this data by calling
     /// `receive_from_old_process`.
-    async fn send_to_new_process(&mut self, _write_pipe: PipeWriter) -> io::Result<()> {
+    async fn send_to_new_process(&mut self, _write_pipe: PipeWriter<'_>) -> io::Result<()> {
         Ok(())
     }
 
