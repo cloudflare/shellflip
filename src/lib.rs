@@ -41,6 +41,7 @@
 //! `LifecycleHandler::new_process_failed` is called and you can undo any changes you made in
 //! preparation for handover. If the new process succeeds, however, the restart task will resolve
 //! and you may terminate the process as usual.
+pub mod fdstore;
 pub mod lifecycle;
 mod pipes;
 pub mod restart_coordination_socket;
@@ -67,6 +68,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::pin::pin;
 use std::process;
 use std::thread;
 use thiserror::Error;
@@ -93,8 +95,6 @@ pub struct RestartConfig {
     pub coordination_socket_path: PathBuf,
     /// Sets environment variables on the newly-started process
     pub environment: Vec<(OsString, OsString)>,
-    /// Receive fine-grained events on the lifecycle of the new process and support data transfer.
-    pub lifecycle_handler: Box<dyn LifecycleHandler>,
     /// Exits early when child process fail to start
     pub exit_on_error: bool,
     /// Sets the signal to listen to on restart. This defaults to SIGUSR1.
@@ -103,11 +103,27 @@ pub struct RestartConfig {
 
 impl RestartConfig {
     /// Prepare the current process to handle restarts, if enabled.
-    pub fn try_into_restart_task(
+    pub fn try_into_restart_task<L: LifecycleHandler + 'static>(
         self,
+        lifecycle_handler: L,
     ) -> io::Result<(impl Future<Output = RestartResult<process::Child>> + Send)> {
         fixup_systemd_env();
-        spawn_restart_task(self)
+        spawn_restart_task(self, Box::new(lifecycle_handler))
+    }
+
+    /// Prepare the current process to handle restarts through systemd and its file descriptor store.
+    ///
+    /// When SIGUSR1 is received, instead of forking like `try_into_restart_task`, the process shall store state in the
+    /// file descriptor store before terminating.
+    ///
+    /// Proper use of this option requires a different restart strategy for your service; instead of letting tasks
+    /// run to completion, the shutdown signal indicates that you need to suspend task state.
+    pub fn try_into_systemd_restart_task<L: LifecycleHandler + 'static>(
+        self,
+        lifecycle_handler: L,
+    ) -> io::Result<(impl Future<Output = RestartResult<()>> + Send)> {
+        fixup_systemd_env();
+        spawn_systemd_restart_task(self, Box::new(lifecycle_handler))
     }
 
     /// Request an already-running service to restart.
@@ -139,7 +155,6 @@ impl Default for RestartConfig {
             enabled: false,
             coordination_socket_path: Default::default(),
             environment: vec![],
-            lifecycle_handler: Box::new(lifecycle::NullLifecycleHandler),
             exit_on_error: true,
             restart_signal: SignalKind::user_defined1(),
         }
@@ -200,6 +215,11 @@ impl RestartResponder {
             }
         }
     }
+
+    /// True if responding to a client, false if restart was triggered by signal.
+    fn client_initiated(&self) -> bool {
+        self.rpc.is_some()
+    }
 }
 
 /// Spawns a thread that can be used to restart the process.
@@ -208,6 +228,7 @@ impl RestartResponder {
 /// The child spawner thread needs to be created before seccomp locks down fork/exec.
 pub fn spawn_restart_task(
     settings: RestartConfig,
+    lifecycle_handler: Box<dyn LifecycleHandler>,
 ) -> io::Result<impl Future<Output = RestartResult<process::Child>> + Send> {
     let socket = match settings.enabled {
         true => Some(settings.coordination_socket_path.as_ref()),
@@ -216,8 +237,7 @@ pub fn spawn_restart_task(
 
     let mut signal_stream = signal(settings.restart_signal)?;
     let (restart_fd, mut socket_stream) = new_restart_coordination_socket_stream(socket)?;
-    let mut child_spawner =
-        ChildSpawner::new(restart_fd, settings.environment, settings.lifecycle_handler);
+    let mut child_spawner = ChildSpawner::new(restart_fd, settings.environment, lifecycle_handler);
 
     Ok(async move {
         startup_complete()?;
@@ -253,6 +273,66 @@ pub fn spawn_restart_task(
                 Err(ChildSpawnError::RestartThreadGone) => {
                     res?;
                 }
+            }
+        }
+    })
+}
+
+/// Spawns a thread that handles state serialization during systemd restart.
+/// Returns a future that resolves when a restart succeeds.
+pub fn spawn_systemd_restart_task(
+    settings: RestartConfig,
+    mut lifecycle_handler: Box<dyn LifecycleHandler>,
+) -> io::Result<impl Future<Output = RestartResult<()>> + Send> {
+    let socket = match settings.enabled {
+        true => Some(settings.coordination_socket_path.as_ref()),
+        false => None,
+    };
+
+    let mut signal_stream = signal(SignalKind::user_defined1())?;
+    // No child process, so drop the spare inheritable socket.
+    let (_, mut socket_stream) = new_restart_coordination_socket_stream(socket)?;
+
+    // Ensure that we can store at least the serialized state into systemd. Without this, no graceful restart can happen!
+    let mut memfd = match fdstore::create_handover_memfd() {
+        Ok(memfd) => memfd,
+        Err(e) => {
+            log::error!(
+                "Failed to write memfd to systemd file descriptor store: {}",
+                e
+            );
+            return Err(e);
+        }
+    };
+
+    Ok(async move {
+        startup_complete()?;
+        loop {
+            let responder = next_restart_request(&mut signal_stream, &mut socket_stream).await?;
+            log::debug!("Received restart signal, serializing state");
+
+            if !responder.client_initiated() {
+                if let Err(e) = sd_notify::notify(false, &[sd_notify::NotifyState::Stopping]) {
+                    log::error!("Failed to notify systemd: {}", e);
+                }
+            }
+
+            let res = lifecycle_handler.send_to_new_process(memfd.as_mut()).await;
+
+            let retry_on_err = responder.client_initiated();
+
+            responder
+                .respond(res.as_ref().map(|_| 0).map_err(|e| e.to_string()))
+                .await;
+
+            if res.is_err() && retry_on_err {
+                // If a call to `send_to_new_process` fails, this will clean up
+                // the memfd to avoid invalid data read on restart.
+                memfd.set_len(0).await.inspect_err(|e| {
+                    log::error!("Failed to truncate handover memfd: {}", e);
+                })?;
+            } else {
+                return res.map_err(|e| e.into());
             }
         }
     })
@@ -465,9 +545,8 @@ async fn send_parent_state(
     notif_w: CompletionSender,
     handover_w: StdFile,
 ) -> io::Result<()> {
-    lifecycle_handler
-        .send_to_new_process(Box::pin(File::from(handover_w)))
-        .await?;
+    let handover_w = pin!(File::from(handover_w));
+    lifecycle_handler.send_to_new_process(handover_w).await?;
 
     // only the child needs the write end
     drop(notif_w);
