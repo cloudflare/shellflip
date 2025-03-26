@@ -40,7 +40,7 @@ struct AppData {
 
 #[async_trait]
 impl LifecycleHandler for AppData {
-    async fn send_to_new_process(&mut self, mut write_pipe: PipeWriter) -> std::io::Result<()> {
+    async fn send_to_new_process(&mut self, mut write_pipe: PipeWriter<'_>) -> std::io::Result<()> {
         if self.restart_generation > 4 {
             log::info!("Four restarts is more than anybody needs, surely?");
             return Err(std::io::Error::new(
@@ -57,21 +57,11 @@ impl LifecycleHandler for AppData {
 async fn main() -> Result<(), Error> {
     env_logger::init();
     let args = Args::parse();
-    let mut app_data = AppData {
-        restart_generation: 0,
-    };
-
-    if let Some(mut handover_pipe) = receive_from_old_process() {
-        app_data.restart_generation = handover_pipe.read_u32().await? + 1;
-    }
-
-    let restart_generation = app_data.restart_generation;
 
     // Configure the essential requirements for implementing graceful restart.
     let restart_conf = RestartConfig {
         enabled: true,
         coordination_socket_path: args.socket.into(),
-        lifecycle_handler: Box::new(app_data),
         ..Default::default()
     };
 
@@ -94,8 +84,18 @@ async fn main() -> Result<(), Error> {
         None => {}
     }
 
+    let mut app_data = AppData {
+        restart_generation: 0,
+    };
+
+    if let Some(mut handover_pipe) = receive_from_old_process() {
+        app_data.restart_generation = handover_pipe.read_u32().await? + 1;
+    }
+
+    let restart_generation = app_data.restart_generation;
+
     // Start the restart thread and get a task that will complete when a restart completes.
-    let restart_task = restart_conf.try_into_restart_task()?;
+    let restart_task = restart_conf.try_into_restart_task(app_data)?;
     // (need to pin this because of the loop below!)
     pin!(restart_task);
     // Create a shutdown coordinator so that we can wait for all client connections to complete.
