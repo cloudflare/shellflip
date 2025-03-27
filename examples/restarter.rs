@@ -68,12 +68,9 @@ async fn main() -> Result<(), Error> {
     let restart_generation = app_data.restart_generation;
 
     // Configure the essential requirements for implementing graceful restart.
-    let restart_conf = RestartConfig {
-        enabled: true,
-        coordination_socket_path: args.socket.into(),
-        lifecycle_handler: Box::new(app_data),
-        ..Default::default()
-    };
+    let mut restart_conf = RestartConfig::new();
+    restart_conf.coordination_socket(args.socket);
+    restart_conf.lifecycle_handler(app_data);
 
     match args.command {
         // Restart an already-running process
