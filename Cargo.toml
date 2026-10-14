@@ -8,6 +8,7 @@ documentation = "https://docs.rs/shellflip"
 keywords = ["restart", "systemd"]
 license = "BSD-3-Clause"
 readme = "README.md"
+include = ["src/**/*.rs", "LICENSE"]
 
 [dependencies]
 async-trait = "0.1.61"
