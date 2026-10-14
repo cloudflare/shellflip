@@ -5,6 +5,7 @@ use futures::sink::SinkExt;
 use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::net::UnixStream;
+use tokio_util::bytes::Bytes;
 use tokio_util::codec::length_delimited::LengthDelimitedCodec;
 use tokio_util::codec::{Decoder, Framed};
 
@@ -39,7 +40,7 @@ impl RestartCoordinationSocket {
     /// Send a message over the socket
     pub async fn send_message(&mut self, msg: RestartMessage) -> RestartResult<()> {
         self.codec
-            .send(serde_json::to_string(&msg).unwrap().into())
+            .send(Bytes::from(serde_json::to_string(&msg).unwrap()))
             .await?;
 
         Ok(())
