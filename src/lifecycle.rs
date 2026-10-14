@@ -38,6 +38,7 @@ impl LifecycleHandler for NullLifecycleHandler {}
 /// The behaviour of this function is undefined if the environment variables used by this crate to
 /// pass file descriptor numbers were set by something other than shellflip spawning a new instance
 /// of the calling process.
+#[must_use]
 pub fn receive_from_old_process() -> Option<PipeReader> {
     if let Ok(handover_fd) = env::var(ENV_HANDOVER_PIPE) {
         unsafe { File::from_fd_string(&handover_fd) }

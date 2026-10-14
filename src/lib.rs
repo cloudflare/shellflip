@@ -105,7 +105,7 @@ impl RestartConfig {
     /// Prepare the current process to handle restarts, if enabled.
     pub fn try_into_restart_task(
         self,
-    ) -> io::Result<(impl Future<Output = RestartResult<process::Child>> + Send)> {
+    ) -> io::Result<impl Future<Output = RestartResult<process::Child>> + Send> {
         fixup_systemd_env();
         spawn_restart_task(self)
     }
@@ -119,7 +119,7 @@ impl RestartConfig {
         }
 
         let socket = UnixStream::connect(self.coordination_socket_path).await?;
-        restart_coordination_socket::RestartCoordinationSocket::new(socket)
+        RestartCoordinationSocket::new(socket)
             .send_restart_command()
             .await
     }
@@ -172,7 +172,7 @@ pub fn fixup_systemd_env() {
 /// of the calling process.
 pub fn startup_complete() -> io::Result<()> {
     if let Ok(notify_fd) = env::var(ENV_NOTIFY_SOCKET) {
-        pipes::CompletionSender(unsafe { std::fs::File::from_fd_string(&notify_fd)? }).send()?;
+        CompletionSender(unsafe { std::fs::File::from_fd_string(&notify_fd)? }).send()?;
     }
     // Avoid sending twice on the notification pipe, if this is manually called outside
     // of the restart task.
@@ -196,22 +196,24 @@ impl RestartResponder {
         };
         if let Some(mut rpc) = self.rpc {
             if let Err(e) = rpc.send_message(RestartMessage::Response(response)).await {
-                log::warn!("Failed to respond to restart coordinator: {}", e);
+                log::warn!("Failed to respond to restart coordinator: {e}");
             }
         }
     }
 }
 
 /// Spawns a thread that can be used to restart the process.
+///
 /// Returns a future that resolves when a restart succeeds, or if restart
 /// becomes impossible.
 /// The child spawner thread needs to be created before seccomp locks down fork/exec.
 pub fn spawn_restart_task(
     settings: RestartConfig,
 ) -> io::Result<impl Future<Output = RestartResult<process::Child>> + Send> {
-    let socket = match settings.enabled {
-        true => Some(settings.coordination_socket_path.as_ref()),
-        false => None,
+    let socket = if settings.enabled {
+        Some(settings.coordination_socket_path.as_ref())
+    } else {
+        None
     };
 
     let mut signal_stream = signal(settings.restart_signal)?;
@@ -238,17 +240,16 @@ pub fn spawn_restart_task(
                     if let Err(e) =
                         sd_notify::notify(true, &[sd_notify::NotifyState::MainPid(child.id())])
                     {
-                        log::error!("Failed to notify systemd: {}", e);
+                        log::error!("Failed to notify systemd: {e}");
                     }
 
                     return Ok(child);
                 }
                 Err(ChildSpawnError::ChildError(e)) => {
                     if settings.exit_on_error {
-                        return Err(anyhow!("Restart failed: {}", e));
-                    } else {
-                        log::error!("Restart failed: {}", e);
+                        return Err(anyhow!("Restart failed: {e}"));
                     }
+                    log::error!("Restart failed: {e}");
                 }
                 Err(ChildSpawnError::RestartThreadGone) => {
                     res?;
@@ -277,7 +278,7 @@ impl ChildSpawner {
         thread::spawn(move || {
             let restart_fd = restart_fd.as_ref().map(OwnedFd::as_fd);
 
-            while let Some(()) = signal_receiver.blocking_recv() {
+            while signal_receiver.blocking_recv() == Some(()) {
                 let child = tokio::runtime::Runtime::new()
                     .unwrap()
                     .block_on(spawn_child(
@@ -376,7 +377,7 @@ fn listen_for_restart_events(
         let sock = match r {
             Ok(sock) => sock,
             Err(e) => {
-                log::error!("Restart coordination socket accept error: {}", e);
+                log::error!("Restart coordination socket accept error: {e}");
                 return None;
             }
         };
@@ -387,14 +388,11 @@ fn listen_for_restart_events(
                 Some(RestartResponder { rpc: Some(rpc) })
             }
             Ok(m) => {
-                log::warn!(
-                    "Restart coordination socket received unexpected message: {:?}",
-                    m
-                );
+                log::warn!("Restart coordination socket received unexpected message: {m:?}");
                 None
             }
             Err(e) => {
-                log::warn!("Restart coordination socket connection error: {}", e);
+                log::warn!("Restart coordination socket connection error: {e}");
                 None
             }
         }
@@ -404,9 +402,9 @@ fn listen_for_restart_events(
 /// Clears the FD_CLOEXEC flag on a fd so it can be inherited by a child process.
 fn clear_cloexec(fd: RawFd) -> nix::Result<()> {
     use nix::fcntl::*;
-    let mut current_flags = FdFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFD)?);
+    let mut current_flags = FdFlag::from_bits_truncate(fcntl(fd, F_GETFD)?);
     current_flags.remove(FdFlag::FD_CLOEXEC);
-    fcntl(fd, FcntlArg::F_SETFD(current_flags))?;
+    fcntl(fd, F_SETFD(current_flags))?;
     Ok(())
 }
 
@@ -472,7 +470,7 @@ async fn send_parent_state(
     // only the child needs the write end
     drop(notif_w);
     match notif_r.recv() {
-        Ok(_) => Ok(()),
+        Ok(()) => Ok(()),
         Err(e) => {
             lifecycle_handler.new_process_failed().await;
             Err(e)
