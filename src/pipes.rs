@@ -25,7 +25,7 @@ pub(crate) fn create_paired_pipes(mode: PipeMode) -> io::Result<(File, File)> {
         PipeMode::ChildWrites => {
             set_cloexec(fds[0])?;
         }
-    };
+    }
 
     let reader = unsafe { File::from_raw_fd(fds[0]) };
     let writer = unsafe { File::from_raw_fd(fds[1]) };
@@ -57,10 +57,7 @@ impl CompletionReceiver {
         let mut buf = [0u8; 1];
 
         if self.0.read(&mut buf)? != 1 {
-            Err(io::Error::new(
-                io::ErrorKind::Other,
-                "child failed to notify parent",
-            ))
+            Err(io::Error::other("child failed to notify parent"))
         } else {
             Ok(())
         }
@@ -72,10 +69,7 @@ pub(crate) struct CompletionSender(pub(crate) File);
 impl CompletionSender {
     pub(crate) fn send(&mut self) -> io::Result<()> {
         if self.0.write(b"1")? != 1 {
-            Err(io::Error::new(
-                io::ErrorKind::Other,
-                "failed to signal parent to close",
-            ))
+            Err(io::Error::other("failed to signal parent to close"))
         } else {
             Ok(())
         }

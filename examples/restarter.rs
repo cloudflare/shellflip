@@ -43,8 +43,7 @@ impl LifecycleHandler for AppData {
     async fn send_to_new_process(&mut self, mut write_pipe: PipeWriter) -> std::io::Result<()> {
         if self.restart_generation > 4 {
             log::info!("Four restarts is more than anybody needs, surely?");
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 "The operation completed successfully",
             ));
         }
@@ -81,11 +80,11 @@ async fn main() -> Result<(), Error> {
             let res = restart_conf.request_restart().await;
             match res {
                 Ok(id) => {
-                    log::info!("Restart succeeded, child pid is {}", id);
+                    log::info!("Restart succeeded, child pid is {id}");
                     return Ok(());
                 }
                 Err(e) => {
-                    log::error!("Restart failed: {}", e);
+                    log::error!("Restart failed: {e}");
                     return Err(e);
                 }
             }
@@ -113,13 +112,13 @@ async fn main() -> Result<(), Error> {
             res = listener.accept() => {
                 match res {
                     Ok((sock, addr)) => {
-                        log::info!("Received connection from {}", addr);
+                        log::info!("Received connection from {addr}");
                         // Spawn a new task to handle the client connection.
                         // Give it a shutdown handle so we can await its completion.
                         tokio::spawn(echo(sock, shutdown_coordinator.handle()));
                     }
                     Err(e) => {
-                        log::warn!("Accept error: {}", e);
+                        log::warn!("Accept error: {e}");
                     }
                 }
             }
@@ -129,7 +128,7 @@ async fn main() -> Result<(), Error> {
                         log::info!("Restart successful, waiting for tasks to complete");
                     }
                     Err(e) => {
-                        log::error!("Restart task failed: {}", e);
+                        log::error!("Restart task failed: {e}");
                     }
                 }
                 // Wait for all clients to complete.
@@ -156,17 +155,17 @@ async fn echo(mut sock: TcpStream, shutdown_handle: Arc<ShutdownHandle>) {
                     Ok(0) => return,
                     Ok(n) => {
                         if let Err(e) = sock.write_all(&buf[..n]).await {
-                            log::error!("write failed: {}", e);
+                            log::error!("write failed: {e}");
                             return;
                         }
                     }
                     Err(e) => {
-                        log::error!("read failed: {}", e);
+                        log::error!("read failed: {e}");
                         return;
                     }
                 }
             }
-            _ = shutdown_signal.on_shutdown() => {
+            () = shutdown_signal.on_shutdown() => {
                 log::info!("shutdown requested but client {} is still active", sock.peer_addr().unwrap());
             }
         }

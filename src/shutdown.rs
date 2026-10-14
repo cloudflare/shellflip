@@ -67,6 +67,7 @@ impl From<&ShutdownHandle> for ShutdownSignal {
 }
 
 /// Coordinates the shutdown process for a group of tasks.
+///
 /// This allows the tasks to get notified when a shutdown is requested,
 /// and allows the main thread to defer termination until all of the tasks have successfully
 /// completed.
@@ -81,6 +82,7 @@ pub struct ShutdownCoordinator {
 
 impl ShutdownCoordinator {
     /// Get a cancellation channel that, when dropped, can be used to close all proxy endpoints created from this object.
+    #[must_use]
     pub fn new() -> Self {
         let (cancellation_tx, cancellation_rx) = watch::channel(false);
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
@@ -96,6 +98,7 @@ impl ShutdownCoordinator {
     }
 
     /// Get a ShutdownHandle to be held by a task that needs to be waited on during shutdown.
+    #[must_use]
     pub fn handle(&self) -> Arc<ShutdownHandle> {
         Arc::clone(&self.shutdown_handle)
     }
@@ -103,6 +106,7 @@ impl ShutdownCoordinator {
     /// Get a ShutdownHandle that can be held by a task that does not need to be waited on, but may
     /// spawn tasks that should be waited on. If the task can upgrade the handle with Arc::upgrade,
     /// then shutdown has not yet started.
+    #[must_use]
     pub fn handle_weak(&self) -> Weak<ShutdownHandle> {
         Arc::downgrade(&self.shutdown_handle)
     }
