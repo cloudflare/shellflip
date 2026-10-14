@@ -86,22 +86,53 @@ const ENV_SYSTEMD_PID: &str = "LISTEN_PID";
 const REBIND_SYSTEMD_PID: &str = "auto";
 
 /// Settings for graceful restarts
+#[non_exhaustive]
 pub struct RestartConfig {
     /// Enables the restart coordination socket for graceful restarts as an alternative to a Unix signal.
-    pub enabled: bool,
+    enabled: bool,
     /// Socket path
-    pub coordination_socket_path: PathBuf,
+    coordination_socket_path: PathBuf,
     /// Sets environment variables on the newly-started process
-    pub environment: Vec<(OsString, OsString)>,
+    environment: Vec<(OsString, OsString)>,
     /// Receive fine-grained events on the lifecycle of the new process and support data transfer.
-    pub lifecycle_handler: Box<dyn LifecycleHandler>,
+    lifecycle_handler: Box<dyn LifecycleHandler>,
     /// Exits early when child process fail to start
-    pub exit_on_error: bool,
+    exit_on_error: bool,
     /// Sets the signal to listen to on restart. This defaults to SIGUSR1.
-    pub restart_signal: SignalKind,
+    restart_signal: SignalKind,
 }
 
 impl RestartConfig {
+    pub fn new() -> Self {
+        Default::default()
+    }
+
+    pub fn coordination_socket<P: AsRef<Path>>(&mut self, path: P) -> &mut Self {
+        self.enabled = true;
+        self.coordination_socket_path = path.as_ref().into();
+        self
+    }
+
+    pub fn environment(&mut self, vars: Vec<(OsString, OsString)>) -> &mut Self {
+        self.environment = vars;
+        self
+    }
+
+    pub fn lifecycle_handler<H: LifecycleHandler + 'static>(&mut self, handler: H) -> &mut Self {
+        self.lifecycle_handler = Box::new(handler);
+        self
+    }
+
+    pub fn should_exit_on_error(&mut self, exit: bool) -> &mut Self {
+        self.exit_on_error = exit;
+        self
+    }
+
+    pub fn restart_signal(&mut self, signal: SignalKind) -> &mut Self {
+        self.restart_signal = signal;
+        self
+    }
+
     /// Prepare the current process to handle restarts, if enabled.
     pub fn try_into_restart_task(
         self,
